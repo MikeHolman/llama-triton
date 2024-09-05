@@ -3,17 +3,16 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.nn.functional as F
 from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
     ParallelEmbedding,
-    RowParallelLinear,
 )
 from torch import nn
+from .kernels import matmul, rms_norm, softmax
 
 
 @dataclass
@@ -49,19 +48,6 @@ class RMSNorm(torch.nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
-        """
-        Apply the RMSNorm normalization to the input tensor.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The normalized tensor.
-
-        """
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
     def forward(self, x):
         """
         Forward pass through the RMSNorm layer.
@@ -73,8 +59,7 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        return rms_norm(x, self.weight, self.eps)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -92,10 +77,6 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
-
-    
-        
-
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
@@ -149,9 +130,6 @@ def apply_rotary_emb(
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-
-        
-
     """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
@@ -173,8 +151,40 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+class LinearTriton(torch.nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        init_method: Callable[
+            [torch.Tensor], torch.Tensor
+        ] = torch.nn.init.xavier_normal_,
+    ) -> None:
+        super(LinearTriton, self).__init__()
+
+        # Keep input parameters
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Divide the weight matrix along the last dimension.
+        world_size = fs_init.get_model_parallel_world_size()
+        self.output_size_per_partition = out_features // world_size
+
+        # Parameters
+        self.weight = torch.nn.Parameter(
+            torch.empty(self.output_size_per_partition, in_features)
+        )
+        init_method(self.weight)
+
+        self.register_parameter("bias", None)
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        return matmul(input_, self.weight)
+
+
 class Attention(nn.Module):
     """Multi-head attention module."""
+
     def __init__(self, args: ModelArgs):
         """
         Initialize the Attention module.
@@ -194,7 +204,6 @@ class Attention(nn.Module):
             wo (RowParallelLinear): Linear transformation for output.
             cache_k (torch.Tensor): Cached keys for attention.
             cache_v (torch.Tensor): Cached values for attention.
-
         """
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
@@ -204,32 +213,24 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = ColumnParallelLinear(
+        self.wq = LinearTriton(
             args.dim,
             args.n_heads * self.head_dim,
-            bias=False,
-            gather_output=False,
             init_method=lambda x: x,
         )
-        self.wk = ColumnParallelLinear(
+        self.wk = LinearTriton(
             args.dim,
             self.n_kv_heads * self.head_dim,
-            bias=False,
-            gather_output=False,
             init_method=lambda x: x,
         )
-        self.wv = ColumnParallelLinear(
+        self.wv = LinearTriton(
             args.dim,
             self.n_kv_heads * self.head_dim,
-            bias=False,
-            gather_output=False,
             init_method=lambda x: x,
         )
-        self.wo = RowParallelLinear(
+        self.wo = LinearTriton(
             args.n_heads * self.head_dim,
             args.dim,
-            bias=False,
-            input_is_parallel=True,
             init_method=lambda x: x,
         )
 
@@ -289,17 +290,23 @@ class Attention(nn.Module):
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        keys = repeat_kv(
+            keys, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(
+            values, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(
+            1, 2
+        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        scores = matmul(
+            xq, keys.transpose(2, 3), fused_add=mask, fused_div=math.sqrt(self.head_dim)
+        )  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        scores = softmax(scores.float()).type_as(xq)
+        output = matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -334,15 +341,9 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        )
-        self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
-        )
-        self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
-        )
+        self.w1 = LinearTriton(dim, hidden_dim, init_method=lambda x: x)
+        self.w2 = LinearTriton(hidden_dim, dim, init_method=lambda x: x)
+        self.w3 = LinearTriton(dim, hidden_dim, init_method=lambda x: x)
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -403,9 +404,7 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask
-        )
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -443,14 +442,15 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
+        self.output = LinearTriton(
             params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
 
         self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
+            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
+            self.params.dim // self.params.n_heads,
+            self.params.max_seq_len * 2,
         )
 
     @torch.inference_mode()
@@ -473,9 +473,7 @@ class Transformer(nn.Module):
 
         mask = None
         if seqlen > 1:
-            mask = torch.full(
-                (seqlen, seqlen), float("-inf"), device=tokens.device
-            )
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
 
             mask = torch.triu(mask, diagonal=1)
 
@@ -483,10 +481,9 @@ class Transformer(nn.Module):
             # only for the new sequence. Thus, the matrix of scores is of size
             # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
             # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack([
-                torch.zeros((seqlen, start_pos), device=tokens.device),
-                mask
-            ]).type_as(h)
+            mask = torch.hstack(
+                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            ).type_as(h)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
