@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from logging import getLogger
+logger = getLogger()
 
 @triton.jit
 def _rms_norm_kernel(
@@ -41,13 +43,25 @@ def _rms_norm_kernel(
 
 
 def rms_norm(x, weight, eps):
-    R, C = x.shape
-    y = torch.empty_like(x)
+    # Flatten all dimensions except the last one
+    num_rows = x.shape[:-1].numel()  # total number of "rows" when flattening all but the last dimension
+    N = x.shape[-1]  # size of the last dimension (columns)
+
+    # Reshape the tensor to 2D (flattening all except the last dimension)
+    x_flat = x.view(-1, N)
+    y_flat = torch.empty_like(x_flat)
+    logger.debug(f"rms_norm: {num_rows}x{N}")
 
     BLOCK_SIZE = 1024
 
-    _rms_norm_kernel[(R,)](x, y, weight, x.stride(0), C, eps, BLOCK_SIZE)
-    return y
+    # Calculate the effective stride, which is the distance between consecutive rows in the flattened view.
+    stride = x.stride(-2) if len(x.shape) > 1 else N
+
+    # Launch the Triton kernel with the flattened tensor
+    _rms_norm_kernel[(num_rows,)](x_flat, y_flat, weight, stride, N, eps, BLOCK_SIZE)
+
+    # Reshape the result back to the original tensor shape
+    return y_flat.view_as(x)
 
 
 # From https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
@@ -112,6 +126,7 @@ def _matmul_kernel(
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
@@ -124,59 +139,79 @@ def _matmul_kernel(
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         # We accumulate along the K dimension.
-        accumulator = tl.dot(a, b, accumulator)
-        if FUSED_DIV != 0:
-            accumulator = tl.fdiv(accumulator, FUSED_DIV)
-        if FUSED_ADD:
-            d = tl.load(d_ptr, mask=c_mask)
-            accumulator += d
+        accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
-    c = accumulator.to(tl.bfloat16)
+    if FUSED_DIV != 0:
+        accumulator = tl.fdiv(accumulator, FUSED_DIV)
+    if FUSED_ADD:
+        d_ptrs = d_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        d = tl.load(d_ptrs, mask=c_mask)
+        accumulator += d
+    c = accumulator.to(tl.float16)
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix C with masks.
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=c_mask)
 
-
-def matmul(a, b, m=None, fused_div=0):
+def matmul(a, b, d=None, fused_div=0):
     # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.shape[-1] == b.shape[-2], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
     assert a.dtype == b.dtype, "Input types must match"
-    M, K = a.shape
-    K, N = b.shape
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    # Flatten all leading dimensions into one batch dimension
+    batch_dims = a.shape[:-2]  # Shape of leading dimensions (e.g., batch dimensions)
+    M, K = a.shape[-2:]        # Last two dimensions of 'a' are M and K
+    N = b.shape[-1]            # Last dimension of 'b' is N
+
+    # Reshape inputs to handle batch dimension (collapse into 2D matrices for matmul)
+    a_reshaped = a.reshape(-1, M, K)
+    b_reshaped = b.reshape(-1, K, N)
+
+    # Allocates output
+    c_reshaped = torch.empty(a_reshaped.shape[:-2] + (M, N), device=a.device, dtype=a.dtype)
+
     # 1D launch kernel where each block gets its own program.
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    _matmul_kernel[grid](
-        a,
-        b,
-        c,  #
-        d,
-        M,
-        N,
-        K,  #
-        a.stride(0),
-        a.stride(1),  #
-        b.stride(0),
-        b.stride(1),  #
-        c.stride(0),
-        c.stride(1),  #
-        BLOCK_SIZE_M=512,
-        BLOCK_SIZE_N=512,
-        BLOCK_SIZE_K=512,
-        GROUP_SIZE_M=1,
-        FUSED_ADD=True if d is not None else False,
-        FUSED_DIV=fused_div,
-    )
-    return c
 
+    # Loop through batch dimension
+    for batch_idx in range(a_reshaped.shape[0]):
+        logger.debug(f"matmul: {batch_idx}: {a_reshaped.shape[0]}")
+        # Get current slices for batch
+        a_slice = a_reshaped[batch_idx]
+        b_slice = b_reshaped
+        d_slice = d[batch_idx] if d is not None else None
+
+        _matmul_kernel[grid](
+            a_slice,
+            b_slice,
+            c_reshaped[batch_idx],  #
+            d_slice,
+            M,
+            N,
+            K,  #
+            a_slice.stride(0),
+            a_slice.stride(1),  #
+            b_slice.stride(0),
+            b_slice.stride(1),  #
+            c_reshaped.stride(0),
+            c_reshaped.stride(1),  #
+            BLOCK_SIZE_M=16,
+            BLOCK_SIZE_N=64,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=4,
+            FUSED_ADD=True if d_slice is not None else False,
+            FUSED_DIV=fused_div,
+        )
+
+    # Reshape the output back to the original batch dimensions
+    c = c_reshaped.view(batch_dims + (M, N))
+
+    return c
 
 # From https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
 @triton.jit
@@ -188,7 +223,6 @@ def _softmax_kernel(
     n_rows,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
-    num_stages: tl.constexpr,
 ):
     # starting row of the program
     row_start = tl.program_id(0)
@@ -217,6 +251,7 @@ def _softmax_kernel(
 
 def softmax(x):
     n_rows, n_cols = x.shape
+    logger.debug(f"softmax: {n_rows}x{n_cols}")
 
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
     num_stages = 4
@@ -229,6 +264,6 @@ def softmax(x):
         y.stride(0),
         n_rows,
         n_cols,
-        BLOCK_SIZE,
-        num_stages,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_stages=num_stages,
     )

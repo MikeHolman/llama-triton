@@ -16,6 +16,9 @@ from fairscale.nn.model_parallel.initialize import (
     model_parallel_is_initialized,
 )
 
+from logging import getLogger
+logger = getLogger()
+
 from llama.model import ModelArgs, Transformer
 from llama.tokenizer import Tokenizer
 
@@ -118,7 +121,7 @@ class Llama:
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
-        print(f"Loaded in {time.time() - start_time:.2f} seconds")
+        print(f"Loaded Llama in {time.time() - start_time:.2f} seconds")
 
         return Llama(model, tokenizer)
 
@@ -173,6 +176,7 @@ class Llama:
 
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device="cuda")
+        logger.debug(f"generate {bsz}")
         input_text_mask = tokens != pad_id
         if min_prompt_len == total_len:
             logits = self.model.forward(tokens, prev_pos)

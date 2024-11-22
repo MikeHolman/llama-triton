@@ -5,7 +5,8 @@ import fire
 
 from llama import Llama
 from typing import List
-
+import logging
+logging.basicConfig(level=logging.DEBUG)
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
